@@ -72,8 +72,6 @@ void task2(void *pvParameters)
   while (1)
   {
     judgemqttconnect();
-
-
   }
 }
 
@@ -178,6 +176,13 @@ void setup()
 
   // 连接MQTT服务器
   mqttCheckConnect();
+
+  //在10秒内反复让舵机角度置零，防止上电时舵机不在零位
+  for (int i = 0; i < 10; i++)
+  {
+    servo.write(0);
+    vTaskDelay(1000 / portTICK_PERIOD_MS); // 1s
+  }
 
 #if !USE_MULTCORE // 如果不使用多核，使用rtos创建任务
   xTaskCreate(task1, "task1", 2048, NULL, 2, NULL);
