@@ -3,207 +3,223 @@
 #include <WiFi.h>
 #include <HTTPClient.h>
 #include <WiFiClient.h>
-#include <PubSubClient.h> //PubSubClient 作者 Nick O’Leary
+#include <PubSubClient.h> 
 #include <HTTPClient.h>
 #include <ESP32Servo.h>
-#include <ArduinoJson.h> // 引入ArduinoJson库
+#include <ArduinoJson.h> 
 #include "wifi_mqtt.h"
 
-#define USE_MULTCORE 1 // 使用多核心
+#define USE_MULTCORE 0 // 使用多核心
 
-hw_timer_t *timer = NULL; // 定义一个定时器
+// 功能引脚宏定义  锁门的是key1，开门的是key2
+#define LED 3  //LED在wifi_mqtt.cpp中也有定义，需要一并修改
+#define KEY1 18
+#define KEY2 19
+#define SERVO 6
+
+// 声明信号量句柄
+// 两个按键对应的二值信号量
+SemaphoreHandle_t xSem_key1 = NULL;
+SemaphoreHandle_t xSem_key2 = NULL;
 
 // 创建一个舵机对象
 Servo servo;
 
-// 创建控制舵机运动的二值信号量的句柄
-SemaphoreHandle_t xSemServo = NULL;
 // 创建进行阿里云下发信息解析的二值信号量的句柄
 SemaphoreHandle_t xSemAliyun = NULL;
 
 // 全局变量声明
-
-
-extern int8_t lockstate_flag;
+extern lockstate_t lockstate_flag;
 extern char message[256];
 
-void IRAM_ATTR TimerEvent()
+// rtos任务
+// 轮询方式读取按键状态，如果对应按键按下，释放对应的二值信号量
+void button_Read(void *pvParameters)
 {
+  // 创键key1 key2的二值信号量
+  xSem_key1 = xSemaphoreCreateBinary();
+  xSem_key2 = xSemaphoreCreateBinary();
+  while (true)
+  {
+    // 读取按键状态
+    if (digitalRead(KEY2) == LOW)
+    {
+      // 软件消抖
+      vTaskDelay(10 / portTICK_PERIOD_MS); // 10ms
+      if (digitalRead(KEY2) == LOW)
+      {
+        // 每次按键按下，释放控制舵机的二值信号量
+        xSemaphoreGive(xSem_key2);
+        // 打印 提示释放了二值信号量
+        // Serial.println("xSem_key2 has been released");
+        sendUDPMessage("key2 has been released\n");
+        vTaskDelay(100 / portTICK_PERIOD_MS); // 100ms
+      }
+    }
+
+    if (digitalRead(KEY1) == LOW)
+    {
+      // 软件消抖
+      vTaskDelay(10 / portTICK_PERIOD_MS); // 10ms
+      if (digitalRead(KEY1) == LOW)
+      {
+        // 每次按键按下，释放控制舵机的二值信号量
+        xSemaphoreGive(xSem_key1);
+        // 打印 提示释放了二值信号量
+        // Serial.println("xSem_key1 has been released");
+        sendUDPMessage("key1 has been released\n");
+        vTaskDelay(100 / portTICK_PERIOD_MS); // 100ms
+      }
+    }
+    vTaskDelay(100 / portTICK_PERIOD_MS); // 100ms
+  }
 }
 
-
-
-void task1(void *pvParameters)
+// rtos任务
+// 判断或者执行锁门操作
+void lock_door(void *pvParameters)
 {
-  while (1)
+  while (true)
   {
-    // 等待二值信号量
-    if (xSemaphoreTake(xSemServo, portMAX_DELAY) == pdTRUE)
+    if (xSemaphoreTake(xSem_key1, portMAX_DELAY) == pdTRUE)
     {
-      Serial.println("task1");
-      // 判断是否可以开门
-      if (lockstate_flag == 1)
+      // Serial.println("lock_door");
+      lockstate_flag = LOCKED;
+      // printf("lockstate_flag = %d\n", lockstate_flag);
+
+      // 发送udp消息
+      char temp_mes[64];
+      sprintf(temp_mes, "lock door %d\n", lockstate_flag);
+      sendUDPMessage(temp_mes);
+
+      // 给服务器发送锁门信息
+      publock();
+      // 指示灯灭
+      digitalWrite(LED, LOW);
+      vTaskDelay(100 / portTICK_PERIOD_MS); // 100ms
+    }
+    vTaskDelay(100 / portTICK_PERIOD_MS); // 100ms
+  }
+}
+
+// rtos任务
+// 判断或者执行开门操作
+void open_door(void *pvParameters)
+{
+  while (true)
+  {
+    if (xSemaphoreTake(xSem_key2, portMAX_DELAY) == pdTRUE)
+    {
+      // 判断标志位lockstate_flag是否为0，如果为0，表示门未锁，可以开门
+      if (lockstate_flag == UNLOCKED)
       {
-        servo.write(75);
+        servo.write(115);
         vTaskDelay(2000 / portTICK_PERIOD_MS); // 2s
         servo.write(0);
+        sendUDPMessage("open door\n");
       }
       else
       {
-        Serial.println("开门失败");
-        //指示灯连闪三次，表示开门失败，闪完后灭
+        // Serial.println("开门失败");
+        sendUDPMessage("开门失败\n");
+        // 指示灯连闪三次，表示开门失败，闪完后灭
         for (int i = 0; i < 3; i++)
         {
-          digitalWrite(5, HIGH);
+          digitalWrite(LED, HIGH);
           vTaskDelay(200 / portTICK_PERIOD_MS); // 500ms
-          digitalWrite(5, LOW);
+          digitalWrite(LED, LOW);
           vTaskDelay(200 / portTICK_PERIOD_MS); // 500ms
         }
       }
-
-      Serial.println("xSemServo has been taken");
-    }
-    vTaskDelay(100 / portTICK_PERIOD_MS); // 100ms
-  }
-}
-
-void task2(void *pvParameters)
-{
-  while (1)
-  {
-    judgemqttconnect();
-  }
-}
-
-void task3(void *pvParameters)
-{
-  while (1)
-  {
-    // 读取按键状态
-    if (digitalRead(4) == LOW)
-    {
-      // 软件消抖
-      vTaskDelay(10 / portTICK_PERIOD_MS); // 10ms
-      if (digitalRead(4) == LOW)
-      {
-        // 每次按键按下，释放控制舵机的二值信号量
-        xSemaphoreGive(xSemServo);
-        // 打印 提示释放了二值信号量
-        Serial.println("xSemServo has been released");
-        vTaskDelay(100 / portTICK_PERIOD_MS); // 100ms
-      }
-    }
-
-    if (digitalRead(8) == LOW)
-    {
-      // 软件消抖
-      vTaskDelay(10 / portTICK_PERIOD_MS); // 10ms
-      if (digitalRead(8) == LOW)
-      {
-        lockstate_flag = 0;
-        printf("lockstate_flag = %d\n", lockstate_flag);
-        publock();
-        //指示灯灭
-        digitalWrite(5, LOW);
-        vTaskDelay(100 / portTICK_PERIOD_MS); // 100ms
-      }
-    }
-    vTaskDelay(100 / portTICK_PERIOD_MS); // 100ms
-  }
-}
-
-
-//创建进行信息解析的任务
-void task4(void *pvParameters)
-{
-  while (1)
-  {
-    //等待二值信号量
-    if (xSemaphoreTake(xSemAliyun, portMAX_DELAY) == pdTRUE)
-    {
-      Serial.println("task4");
-
-      //解析信息
-      processJsonMessage(message);
-
-      //根据当前lockstate_flag的值，确定指示灯的状态
-      if (lockstate_flag == 1)
-      {
-        digitalWrite(5, HIGH);
-      }
-      else
-      {
-        digitalWrite(5, LOW);
-      }
-
-      Serial.println("xSemServo has been taken");
       vTaskDelay(100 / portTICK_PERIOD_MS); // 100ms
     }
-    vTaskDelay(500 / portTICK_PERIOD_MS); // 500ms
+    vTaskDelay(100 / portTICK_PERIOD_MS); // 100ms
   }
 }
 
+// rtos任务
+// 使用udp向电脑发送调试信息 兼顾每5秒根据lockstate_flag的值调整led的状态
+void sendUDPMessage_task(void *pvParameters)
+{
+  while (true)
+  {
+    sendUDPMessage("esp32-c3 is normally running\n");
+
+    // 发送lockstate_flag的值
+    if (lockstate_flag == LOCKED)
+    {
+      // sendUDPMessage("lockstate_flag = LOCKED\n");
+      sendUDPMessage("门锁已锁\n");
+      digitalWrite(LED, LOW);
+    }
+    else if (lockstate_flag == UNLOCKED)
+    {
+      // sendUDPMessage("lockstate_flag = UNLOCKED\n");
+      sendUDPMessage("门已解锁\n");
+      digitalWrite(LED, HIGH);
+    }
+
+    vTaskDelay(5000 / portTICK_PERIOD_MS); // 5s
+  }
+}
+
+
+// 配置各个引脚，连接WiFi，连接MQTT服务器，创建任务
 void setup()
 {
   // put your setup code here, to run once:
   Serial.begin(115200);
+  // 初始化按键，默认上拉输入，在进程中读取按键状态 低电平表示按下
+  pinMode(KEY1, INPUT_PULLUP); // 这个按键用于开门
+  pinMode(KEY2, INPUT_PULLUP); // 这个按键用于锁门
 
-  // 初始化定时器中断
-  timer = timerBegin(0, 80, true);                // 初始化定时器，80分频，计数器向上计数 1us
-  timerAttachInterrupt(timer, &TimerEvent, true); // 绑定定时器的中断处理函数
-  timerAlarmWrite(timer, 1000000, true);          // 1s
-  timerAlarmEnable(timer);                        //  使能定时器
+  // io5作为指示灯，用于在外面提示门锁是否打开
+  pinMode(LED, OUTPUT);
+  // 初值为低电平
+  digitalWrite(LED, LOW);
 
-  // 初始化按键，默认上拉输入，在进程中读取按键状态
-  pinMode(8, INPUT_PULLUP); // 这个按键用于开门
-  pinMode(4, INPUT_PULLUP); // 这个按键用于锁门
-
-  //io5作为指示灯，用于在外面提示门锁是否打开
-  pinMode(5, OUTPUT);
-  //初值为低电平
-  digitalWrite(5, LOW);
-
-  // 创建二值信号量，用于外部中断控制舵机任务
-  xSemServo = xSemaphoreCreateBinary();
   // 创建二值信号量，用于阿里云下发信息解析任务
   xSemAliyun = xSemaphoreCreateBinary();
 
   // 指定舵机引脚
-  servo.attach(9);
+  servo.attach(SERVO);
 
-  // 连接WiFi
-  Wifi_Connect();
+  // 初始化WiFi、MQTT、UDP
+  wifi_init();
 
-  // 连接MQTT服务器
-  mqttCheckConnect();
-
-  //在10秒内反复让舵机角度置零，防止上电时舵机不在零位
-  for (int i = 0; i < 10; i++)
-  {
-    servo.write(0);
-    vTaskDelay(1000 / portTICK_PERIOD_MS); // 1s
-  }
+  Serial.println("setup");
+  sendUDPMessage("系统已启动\n");
 
 #if !USE_MULTCORE // 如果不使用多核，使用rtos创建任务
-  xTaskCreate(task1, "task1", 2048, NULL, 2, NULL);
-  xTaskCreate(task2, "task2", 2048, NULL, 1, NULL);//检测网络连接的任务，优先级最低
-  // 创建任务，用于循环读取按键状态
-  xTaskCreate(task3, "task3", 2048, NULL, 3, NULL);//检测按键状态的任务，优先级最高
+
+  xTaskCreate(button_Read, "button_Read", 1024, NULL, 5, NULL);               // 用于轮询读取两个按键的状态
+  xTaskCreate(lock_door, "lock_door", 1024, NULL, 4, NULL);                   // 用于判断或者执行锁门操作
+  xTaskCreate(open_door, "open_door", 1024, NULL, 4, NULL);                   // 用于判断或者执行开门操作
+  xTaskCreate(mqttCheckConnect, "mqttCheckConnect", 4 * 1024, NULL, 1, NULL); // 用于检测mqtt连接状态
+  xTaskCreate(mqttcallback_process, "mqttcallback", 1024, NULL, 3, NULL);     // 用于处理mqtt接收到的信息
+  xTaskCreate(sendUDPMessage_task, "sendUDPMessage", 1024, NULL, 2, NULL);    // 用于发送udp消息
 
 #else // 使用多核
-  xTaskCreatePinnedToCore(task1, "task1", 2048, NULL, 2, NULL, 0); // 0号核心
-  xTaskCreatePinnedToCore(task2, "task2", 1024, NULL, 1, NULL, 1); // 1号核心
-  xTaskCreatePinnedToCore(task3, "task3", 2048, NULL, 3, NULL, 0); //0号核心 检测按键状态的任务，优先级最高
-  //创建进行信息解析的任务
-  xTaskCreatePinnedToCore(task4, "task4", 1024, NULL, 1, NULL, 0);
+  xTaskCreatePinnedToCore(task1, "task1", 2048, NULL, 3, NULL, 0); // 0号核心
+  xTaskCreatePinnedToCore(task2, "task2", 1024, NULL, 2, NULL, 0); // 1号核心
+  xTaskCreatePinnedToCore(task3, "task3", 2048, NULL, 4, NULL, 0); // 0号核心 检测按键状态的任务，优先级最高
+  // 创建进行信息解析的任务
+  xTaskCreatePinnedToCore(task4, "task4", 1024, NULL, 1, NULL, 1);
 
 #endif
 }
 
 void loop()
 {
-  // put your main code here, to run repeatedly:
+#if 0
+  sendUDPMessage("hello world");
+  vTaskDelay(1000 / portTICK_PERIOD_MS); // 1s
+  Serial.print("loop");
+  sendUDPMessage("舵机测试\n");
+  servo.write(115);
+  vTaskDelay(2000 / portTICK_PERIOD_MS); // 2s
+  servo.write(0);
+  vTaskDelay(2000 / portTICK_PERIOD_MS); // 2s
+
+#endif
 }
-
-
-
